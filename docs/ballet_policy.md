@@ -1,8 +1,9 @@
 # Ballet V1 policy
 
 `Mjlab-Ballet-Flat-MicroDuck` is the first training scaffold for a ballet-like
-one-legged low hop. It is intentionally narrow: the right leg supports and
-hops, the left leg is the display leg, and yaw turning is disabled.
+one-legged pirouette. It is intentionally narrow: the right leg remains the
+support/pivot leg, the left leg is the display leg, and the commanded turn is
+a moderate counter-clockwise 0.8 rad/s.
 
 ## Command and deployment contract
 
@@ -13,19 +14,20 @@ twist values mean:
 [active, free_leg_side, turn]
 ```
 
-- `[1, 1, 0]` enters and maintains the V1 left-leg-up hop.
+- `[1, 1, 0.8]` lifts the left leg and tracks a 0.8 rad/s yaw rate.
 - `[0, 1, 0]` asks the same policy to land and return to the two-foot HOME pose.
 
 The active flag is resampled every 3–6 seconds in training. This is deliberate:
-robotd may begin the unwind at any hop phase, including flight. A policy that
-only saw episode-boundary stops would not have a trained exit from that state.
+robotd may begin the unwind at any rotation phase. A policy that only saw
+episode-boundary stops would not have learned to brake, lower the display leg
+and return to HOME from a moving state.
 
 After exporting `ballet.onnx`, a local file can be installed as a generic
 perpetual skill without adding a new daemon RPC:
 
 ```bash
 sudo robotctl policy add ballet /path/to/ballet.onnx \
-  --hold 5 --command 1,1,0 \
+  --hold 5 --command 1,1,0.8 \
   --unwind 2.5 --unwind-command 0,1,0
 robotctl robot do ballet
 ```
@@ -36,17 +38,24 @@ robot before treating it as a deployment value.
 ## Training progression
 
 The initial reward stack first pays for right-foot-only support, left-foot
-clearance and the display pose. At iteration 300 the low trunk-height target
-starts ramping in. At iteration 600 the stateful hop completion reward starts;
-it pays only for:
+clearance and the display pose. Losing right-foot contact or touching down with
+the left foot is explicitly penalised. At iteration 300 yaw-rate tracking and
+its constant-gradient L1 bootstrap turn on; the main tracking reward reaches
+full weight at iteration 600:
 
 ```text
-right support -> both feet airborne -> right support, left foot still clear
+right-foot support + left foot raised + trunk yaw rate near 0.8 rad/s
 ```
 
-Free-foot contact invalidates an attempt. The latch is cleared on command-off,
-so landing during unwind cannot farm hop reward. Existing BallKick curricula
-continue to phase in action smoothness, CoM/head-CoM randomization and pushes.
+The same rate objective targets exactly zero when the command switches off, so
+braking is trained rather than left to a fixed timeout. A weak planar-velocity
+cost discourages travelling across the floor, while leaving enough freedom for
+the trunk to orbit slightly around the offset support foot. The all-axis angular
+momentum penalty is removed because it would directly oppose yaw rotation.
+
+Existing BallKick curricula continue to phase in CoM/head-CoM randomization and
+pushes. Ballet caps the final action-rate penalty at -0.5 instead of -1.0 so the
+balance corrections and yaw-generating motion remain economically viable.
 
 ```bash
 # Cheap configuration/runtime smoke test first.
@@ -67,11 +76,12 @@ uv run scripts/export.py Mjlab-Ballet-Flat-MicroDuck \
 ## What V1 does not claim
 
 - No policy weights are included; this change supplies a trainable environment.
-- No true pointe motion: Microduck has no toe joint.
-- No left/right unified policy or yaw choreography yet.
+- No true pointe motion: Microduck has no toe joint; the support sole must pivot
+  or slip against the ground model.
+- No left/right unified policy, reverse turn or multi-step choreography yet.
 - Reward/config tests and a short training smoke test verify wiring, not learned
   skill quality or hardware safety.
 
-First hardware trials belong on a support rig, with a reduced action scale and
-short hold. Inspect landing impact, joint tracking error, battery sag and servo
-temperature before increasing hop height or duration.
+First hardware trials belong on a support rig, with a reduced action scale,
+lower turn rate and short hold. Inspect support-foot slip, tilt, joint tracking
+error, battery sag and servo temperature before increasing speed or duration.

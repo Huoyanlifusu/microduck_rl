@@ -5126,7 +5126,7 @@ def zero_command_padding(
 
 
 # --------------------------------------------------------------------------- #
-# Ballet: commanded one-legged hopping                                       #
+# Ballet: commanded one-legged pirouette                                     #
 # --------------------------------------------------------------------------- #
 
 
@@ -5134,16 +5134,16 @@ class BalletCommand(UniformVelocityCommand):
     """Binary ballet command carried in the shared three-value twist slot.
 
     The wire/runtime contract is ``[active, free_leg_side, turn]``.  V1 trains
-    one side and no turn, but keeps all three values explicit so the exported
-    policy can be installed as a generic robotd skill:
+    one side and one moderate turn rate, while keeping all three values
+    explicit so the exported policy can be installed as a generic robotd skill:
 
-    - ``active=1``: lift the configured free leg and repeat low hops;
+    - ``active=1``: lift the configured free leg and track the commanded turn;
     - ``active=0``: land and return to the two-foot HOME stand;
     - ``free_leg_side=+1``: left leg is free (right leg supports).
 
     Resampling the flag mid-episode is load-bearing: robotd switches to the
-    idle command when a skill window expires, which may happen at any point in
-    the hop cycle.  Training only active episodes would make that unwind an
+    idle command when a skill window expires, which may happen at any rotation
+    phase.  Training only active episodes would make that unwind an
     out-of-distribution transition.
     """
 
@@ -5164,7 +5164,8 @@ class BalletCommand(UniformVelocityCommand):
         active = (torch.rand(n, device=self.device) < self._active_prob).float()
         self.vel_command_b[env_ids, 0] = active
         self.vel_command_b[env_ids, 1] = self._free_leg_side
-        self.vel_command_b[env_ids, 2] = self._turn
+        # Match deployment's unwind command exactly: inactive means no turn.
+        self.vel_command_b[env_ids, 2] = active * self._turn
 
     def _update_command(self) -> None:
         pass
@@ -5209,14 +5210,27 @@ def ballet_unique_support(
 ) -> torch.Tensor:
     """Reward right-support/left-free contact while ballet is active.
 
-    Flight returns zero rather than a penalty; the hop-cycle reward owns that
-    part of the motion.  The free foot touching never scores, preventing the
-    easy two-foot pogo solution.
+    The free foot touching or the support foot lifting never scores.  A
+    separate contact-violation term makes both failure modes explicitly costly
+    during the pirouette.
     """
     active = _ballet_active(env, command_name)
     support = _contact_found(env, support_sensor)
     free = _contact_found(env, free_sensor)
     return (active & support & ~free).float()
+
+
+def ballet_contact_violation(
+    env: ManagerBasedRlEnv,
+    support_sensor: str,
+    free_sensor: str,
+    command_name: str = "twist",
+) -> torch.Tensor:
+    """Cost invalid active contacts: support lost or display foot grounded."""
+    active = _ballet_active(env, command_name)
+    support = _contact_found(env, support_sensor)
+    free = _contact_found(env, free_sensor)
+    return (active & (~support | free)).float()
 
 
 def ballet_free_foot_height(
@@ -5265,60 +5279,56 @@ def ballet_commanded_height(
     ) * gate.float()
 
 
-def ballet_hop_cycle(
+def ballet_turn_rate_track(
     env: ManagerBasedRlEnv,
-    support_sensor: str,
-    free_sensor: str,
     command_name: str = "twist",
-    min_air_time: float = 0.04,
-    max_air_time: float = 0.40,
+    std: float = 0.45,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """One pulse for ``support -> flight -> same support``.
+    """Track commanded trunk yaw rate, including a zero-rate unwind.
 
-    A small state machine makes the reward unfarmable by contact chatter.  It
-    arms only from unique support, accumulates time only with both feet clear,
-    and pays once when the support foot returns while the free foot stays off
-    the floor.  Touching the free foot invalidates the attempt.  Disabling the
-    command clears the latch so unwind cannot accidentally earn hop credit.
+    The third Ballet command value is an angular velocity in rad/s.  While the
+    skill is active the policy tracks that value; when inactive the target is
+    exactly zero so the same policy learns to brake before returning HOME.
     """
+    asset: Entity = env.scene[asset_cfg.name]
     active = _ballet_active(env, command_name)
-    support = _contact_found(env, support_sensor)
-    free = _contact_found(env, free_sensor)
-    unique_support = support & ~free
-    flight = ~support & ~free
+    commanded = env.command_manager.get_command(command_name)[:, 2]
+    target = torch.where(active, commanded, torch.zeros_like(commanded))
+    omega_z = asset.data.root_link_ang_vel_b[:, 2]
+    return torch.exp(-(((omega_z - target) / std) ** 2))
 
-    if not hasattr(env, "_ballet_ready"):
-        env._ballet_ready = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-        env._ballet_airborne = torch.zeros(
-            env.num_envs, dtype=torch.bool, device=env.device
-        )
-        env._ballet_air_time = torch.zeros(env.num_envs, device=env.device)
 
-    fresh = env.episode_length_buf <= 1
-    clear = fresh | ~active | free
-    env._ballet_ready[clear] = False
-    env._ballet_airborne[clear] = False
-    env._ballet_air_time[clear] = 0.0
+def ballet_turn_rate_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Constant-gradient companion to ``ballet_turn_rate_track``."""
+    asset: Entity = env.scene[asset_cfg.name]
+    active = _ballet_active(env, command_name)
+    commanded = env.command_manager.get_command(command_name)[:, 2]
+    target = torch.where(active, commanded, torch.zeros_like(commanded))
+    omega_z = asset.data.root_link_ang_vel_b[:, 2]
+    return -torch.abs(omega_z - target)
 
-    env._ballet_ready |= active & unique_support
-    takeoff = active & env._ballet_ready & flight
-    env._ballet_airborne |= takeoff
-    env._ballet_air_time = torch.where(
-        env._ballet_airborne & flight,
-        env._ballet_air_time + env.step_dt,
-        env._ballet_air_time,
-    )
 
-    landed = (
-        active
-        & env._ballet_airborne
-        & unique_support
-        & (env._ballet_air_time >= min_air_time)
-        & (env._ballet_air_time <= max_air_time)
-    )
-    env._ballet_airborne[landed] = False
-    env._ballet_air_time[landed] = 0.0
-    return landed.float()
+def ballet_planar_drift(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Squared trunk XY velocity while turning; use with a negative weight.
+
+    Kept deliberately weak because a trunk rotating about an offset support
+    foot has some legitimate planar velocity.  It only discourages translating
+    across the floor instead of performing a local pirouette.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    v_xy = asset.data.root_link_lin_vel_b[:, :2]
+    return torch.sum(torch.square(v_xy), dim=1) * _ballet_active(
+        env, command_name
+    ).float()
 
 
 def head_pose_tracking(

@@ -12,6 +12,7 @@ from mjlab_microduck.tasks.microduck_ballet_env_cfg import (
     FREE_LEG_SIDE,
     FREE_SENSOR,
     SUPPORT_SENSOR,
+    TURN_RATE,
     MicroduckBalletRlCfg,
     make_microduck_ballet_env_cfg,
 )
@@ -23,7 +24,7 @@ def test_ballet_command_matches_the_runtime_skill_contract():
     assert isinstance(cmd, microduck_mdp.BalletCommandCfg)
     assert cmd.active_prob == ACTIVE_PROB
     assert cmd.free_leg_side == FREE_LEG_SIDE == 1.0
-    assert cmd.turn == 0.0
+    assert cmd.turn == TURN_RATE == 0.8
     assert cmd.resampling_time_range == COMMAND_DWELL_S
 
 
@@ -46,36 +47,39 @@ def test_ballet_removes_the_ball_and_wires_both_feet():
     assert FREE_SENSOR in sensor_names
 
 
-def test_ballet_reward_stack_requires_a_valid_hop_and_safe_unwind():
+def test_ballet_reward_stack_requires_one_leg_turn_and_safe_unwind():
     cfg = make_microduck_ballet_env_cfg()
     rewards = cfg.rewards
     for name in (
         "unique_support",
+        "contact_violation",
         "free_foot_height",
         "free_leg_pose",
-        "hop_height",
-        "hop_cycle",
+        "turn_rate_track",
+        "turn_rate_l1",
+        "planar_drift",
         "idle_pose",
         "idle_height",
-        "gentle_landing",
+        "gentle_transition",
     ):
         assert name in rewards
-    assert rewards["hop_cycle"].params["support_sensor"] == SUPPORT_SENSOR
-    assert rewards["hop_cycle"].params["free_sensor"] == FREE_SENSOR
     # trunk_vertical_accel_penalty is self-negating: positive weight is the
     # only sign that makes shocks costly.
-    assert rewards["gentle_landing"].weight > 0.0
+    assert rewards["gentle_transition"].weight > 0.0
     assert rewards["idle_pose"].params["when_active"] is False
+    assert "angular_momentum" not in rewards
 
 
-def test_hop_curriculum_starts_after_single_leg_balance():
+def test_turn_curriculum_starts_after_single_leg_balance():
     cfg = make_microduck_ballet_env_cfg()
-    height = cfg.curriculum["hop_height_weight"].params["weight_stages"]
-    cycle = cfg.curriculum["hop_cycle_weight"].params["weight_stages"]
-    assert height[0]["weight"] == 0.0
-    assert cycle[0]["weight"] == 0.0
-    assert height[-1]["weight"] > 0.0
-    assert cycle[-1]["weight"] > height[-1]["weight"]
+    track = cfg.curriculum["turn_rate_track_weight"].params["weight_stages"]
+    bootstrap = cfg.curriculum["turn_rate_l1_weight"].params["weight_stages"]
+    action_rate = cfg.curriculum["action_rate_weight"].params["weight_stages"]
+    assert track[0]["weight"] == 0.0
+    assert bootstrap[0]["weight"] == 0.0
+    assert track[-1]["weight"] == 6.0
+    assert bootstrap[-1]["weight"] == 0.25
+    assert action_rate[-1]["weight"] == -0.5
 
 
 def test_ballet_is_asymmetric_and_has_a_backlash_build():
@@ -88,37 +92,48 @@ def test_ballet_is_asymmetric_and_has_a_backlash_build():
         assert terms["joint_vel"].func is microduck_mdp.joint_vel_rel_backlash
 
 
-def test_hop_cycle_pays_once_for_same_support_foot_landing():
-    command = torch.tensor([[1.0, 1.0, 0.0]])
-    support = SimpleNamespace(data=SimpleNamespace(found=torch.tensor([[1.0]])))
-    free = SimpleNamespace(data=SimpleNamespace(found=torch.tensor([[0.0]])))
+def test_turn_rate_tracks_command_and_brakes_during_unwind():
+    command = torch.tensor([[1.0, 1.0, TURN_RATE]])
+    robot = SimpleNamespace(
+        data=SimpleNamespace(root_link_ang_vel_b=torch.tensor([[0.0, 0.0, TURN_RATE]]))
+    )
     env = SimpleNamespace(
         num_envs=1,
         device=torch.device("cpu"),
-        step_dt=0.02,
-        episode_length_buf=torch.tensor([2]),
         command_manager=SimpleNamespace(get_command=lambda _: command),
-        scene=SimpleNamespace(sensors={SUPPORT_SENSOR: support, FREE_SENSOR: free}),
+        scene={"robot": robot},
     )
 
-    def reward():
-        return microduck_mdp.ballet_hop_cycle(
-            env,
-            support_sensor=SUPPORT_SENSOR,
-            free_sensor=FREE_SENSOR,
-            min_air_time=0.04,
-        )
+    assert microduck_mdp.ballet_turn_rate_track(env).item() == 1.0
+    assert microduck_mdp.ballet_turn_rate_l1(env).item() == 0.0
 
-    assert reward().item() == 0.0  # arm from unique support
+    command[:, 0] = 0.0
+    assert microduck_mdp.ballet_turn_rate_track(env).item() < 0.1
+    robot.data.root_link_ang_vel_b[:, 2] = 0.0
+    assert microduck_mdp.ballet_turn_rate_track(env).item() == 1.0
+
+
+def test_contact_violation_rejects_flight_and_free_foot_touchdown():
+    command = torch.tensor([[1.0, 1.0, TURN_RATE]])
+    support = SimpleNamespace(data=SimpleNamespace(found=torch.tensor([[1.0]])))
+    free = SimpleNamespace(data=SimpleNamespace(found=torch.tensor([[0.0]])))
+    sensors = {SUPPORT_SENSOR: support, FREE_SENSOR: free}
+    env = SimpleNamespace(
+        num_envs=1,
+        device=torch.device("cpu"),
+        command_manager=SimpleNamespace(get_command=lambda _: command),
+        scene=SimpleNamespace(sensors=sensors),
+    )
+
+    assert microduck_mdp.ballet_contact_violation(
+        env, SUPPORT_SENSOR, FREE_SENSOR
+    ).item() == 0.0
     support.data.found.zero_()
-    assert reward().item() == 0.0  # first 20 ms of flight
-    assert reward().item() == 0.0  # valid 40 ms flight, still airborne
+    assert microduck_mdp.ballet_contact_violation(
+        env, SUPPORT_SENSOR, FREE_SENSOR
+    ).item() == 1.0
     support.data.found.fill_(1.0)
-    assert reward().item() == 1.0  # land on the same support foot
-    assert reward().item() == 0.0  # no repeated reward while planted
-
-    support.data.found.zero_()
-    reward()
-    reward()
     free.data.found.fill_(1.0)
-    assert reward().item() == 0.0  # free-foot landing invalidates the attempt
+    assert microduck_mdp.ballet_contact_violation(
+        env, SUPPORT_SENSOR, FREE_SENSOR
+    ).item() == 1.0

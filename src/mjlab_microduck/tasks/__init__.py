@@ -168,8 +168,8 @@ register_mjlab_task(
     runner_cls=MicroduckOnPolicyRunner,
 )
 
-# Ballet V1 — right-leg support, left display leg, commanded low hopping with
-# an arbitrary-phase unwind back to the two-foot HOME stand.
+# Ballet V1 — right-leg support, left display leg, commanded pirouette with an
+# arbitrary-phase brake/unwind back to the two-foot HOME stand.
 register_mjlab_task(
     task_id="Mjlab-Ballet-Flat-MicroDuck",
     env_cfg=make_microduck_ballet_env_cfg(),
