@@ -60,6 +60,8 @@ def test_ballet_reward_stack_requires_one_leg_turn_and_safe_unwind():
         "idle_height",
         "gentle_transition",
         "leg_action_acceleration",
+        "pose_stand_neck",
+        "height_stand",
     ):
         assert name in rewards
     # trunk_vertical_accel_penalty is self-negating: positive weight is the
@@ -67,6 +69,14 @@ def test_ballet_reward_stack_requires_one_leg_turn_and_safe_unwind():
     assert rewards["gentle_transition"].weight > 0.0
     assert rewards["idle_pose"].params["when_active"] is False
     assert rewards["turn_rate_track"].params["upright_std"] == 0.25
+    assert rewards["turn_rate_track"].params["neck_std"] == 0.20
+    assert rewards["pose_stand_neck"].weight == 3.0
+    assert rewards["pose_stand_neck"].params["joint_indices"] == [5, 6, 7, 8]
+    assert rewards["height_stand"].weight == 2.0
+    assert rewards["height_stand"].params["std"] == 0.035
+    assert rewards["free_foot_height"].weight == 2.5
+    assert rewards["free_leg_pose"].weight == 2.5
+    assert rewards["contact_violation"].weight == -2.0
     assert "angular_momentum" not in rewards
 
 
@@ -106,7 +116,10 @@ def test_turn_rate_tracks_command_and_brakes_during_unwind():
         data=SimpleNamespace(
             root_link_ang_vel_b=torch.tensor([[0.0, 0.0, TURN_RATE]]),
             root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
-        )
+            joint_pos=torch.zeros(1, 14),
+            default_joint_pos=torch.zeros(1, 14),
+        ),
+        find_joints=lambda _: (list(range(14)), [f"joint_{i}" for i in range(14)]),
     )
     env = SimpleNamespace(
         num_envs=1,
@@ -115,9 +128,18 @@ def test_turn_rate_tracks_command_and_brakes_during_unwind():
         scene={"robot": robot},
     )
 
-    track = microduck_mdp.ballet_turn_rate_track(env, std=0.30, upright_std=0.25)
+    track = microduck_mdp.ballet_turn_rate_track(
+        env, std=0.30, upright_std=0.25, neck_std=0.20
+    )
     assert track.item() == 1.0
     assert microduck_mdp.ballet_turn_rate_l1(env).item() == 0.0
+
+    robot.data.joint_pos[:, 5] = 0.4
+    bowed_track = microduck_mdp.ballet_turn_rate_track(
+        env, std=0.30, upright_std=0.25, neck_std=0.20
+    )
+    assert bowed_track.item() < 0.4
+    robot.data.joint_pos.zero_()
 
     robot.data.root_link_quat_w[:] = torch.tensor([[0.9848, 0.1736, 0.0, 0.0]])
     tilted_track = microduck_mdp.ballet_turn_rate_track(

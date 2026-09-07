@@ -21,6 +21,13 @@ TURN and IDLE windows alternate every 2.0-2.6 seconds in training. Thus every
 finite turn is followed by a learned brake, leg lowering, and HOME recovery.
 Random window lengths prevent the policy from memorising one exact stop angle.
 
+The four neck/head actions remain in the shared 14-action output, but Ballet
+A2 holds them at HOME in both phases.  The turn reward is multiplied by a
+strict four-joint neck-pose score, so lowering the head as a counterweight can
+no longer be traded for yaw reward.  An always-on trunk-height target likewise
+prevents a deep crouch.  This is still a planted-right-foot pirouette, not a
+jump: loss of support-foot contact remains a violation.
+
 After exporting `ballet.onnx`, a local file can be installed as a generic
 timed skill without adding a new daemon RPC:
 
@@ -37,8 +44,9 @@ robot before treating it as a deployment value.
 ## Training progression
 
 The initial reward stack first pays for right-foot-only support, left-foot
-clearance and the display pose. Losing right-foot contact or touching down with
-the left foot is explicitly penalised. At iteration 300 yaw-rate tracking and
+clearance, the display pose, HOME head/neck pose and standing trunk height.
+Losing right-foot contact or touching down with the left foot is explicitly
+penalised. At iteration 300 yaw-rate tracking and
 its constant-gradient L1 bootstrap turn on; the main tracking reward reaches
 full weight at iteration 600:
 

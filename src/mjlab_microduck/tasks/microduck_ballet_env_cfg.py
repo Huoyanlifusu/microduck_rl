@@ -7,7 +7,8 @@ This is deliberately a finite-angle skill with a learned brake and unwind:
 V1 fixes ``free_leg_side=+1`` (left leg lifted, right leg supporting) and asks
 for 0.4 rad/s during an alternating 2.0-2.6 s active window: about 46-60
 degrees before tracking zero yaw rate, lowering the free leg and returning to
-a two-foot HOME stand.
+a two-foot HOME stand.  The head/neck stays at HOME throughout; it is not
+available as a counterweight for a reward-hacking bow.
 
 The environment is derived from BallKick rather than rebuilt from mjlab's
 base.  BallKick is the closest proven sim2real recipe: full ground-contact
@@ -49,6 +50,7 @@ FREE_FOOT_Z = 0.055
 
 _ALL_JOINTS = list(range(14))
 _FREE_LEG_JOINTS = [0, 1, 2, 3, 4]
+_NECK_JOINTS = [5, 6, 7, 8]
 
 # A readable lifted-leg silhouette, not a human anatomical ballet pose.  The
 # support leg is deliberately omitted so it remains free to balance and pivot.
@@ -124,10 +126,18 @@ def make_microduck_ballet_env_cfg(play: bool = False):
         "ball_speed_overshoot",
         "support_foot_grounded",
         "pose_stand_legs",
-        "pose_stand_neck",
-        "height_stand",
     ):
         cfg.rewards.pop(name, None)
+
+    # Keep the head up and the trunk near standing height in BOTH phases.
+    # V1 accidentally removed these inherited BallKick terms, leaving the
+    # neck as a free counterweight and allowing a deep crouch during TURN.
+    cfg.rewards["pose_stand_neck"].weight = 3.0
+    cfg.rewards["pose_stand_neck"].params.update(
+        {"std": 0.20, "joint_indices": _NECK_JOINTS}
+    )
+    cfg.rewards["height_stand"].weight = 2.0
+    cfg.rewards["height_stand"].params["std"] = 0.035
 
     # Dense bootstrap: form and hold the one-leg silhouette.
     cfg.rewards["unique_support"] = RewardTermCfg(
@@ -141,7 +151,7 @@ def make_microduck_ballet_env_cfg(play: bool = False):
     )
     cfg.rewards["contact_violation"] = RewardTermCfg(
         func=microduck_mdp.ballet_contact_violation,
-        weight=-1.0,
+        weight=-2.0,
         params={
             "support_sensor": SUPPORT_SENSOR,
             "free_sensor": FREE_SENSOR,
@@ -150,7 +160,7 @@ def make_microduck_ballet_env_cfg(play: bool = False):
     )
     cfg.rewards["free_foot_height"] = RewardTermCfg(
         func=microduck_mdp.ballet_free_foot_height,
-        weight=1.5,
+        weight=2.5,
         params={
             "target_height": FREE_FOOT_Z,
             "std": 0.025,
@@ -160,7 +170,7 @@ def make_microduck_ballet_env_cfg(play: bool = False):
     )
     cfg.rewards["free_leg_pose"] = RewardTermCfg(
         func=microduck_mdp.ballet_commanded_pose,
-        weight=1.5,
+        weight=2.5,
         params={
             "when_active": True,
             "command_name": "twist",
@@ -180,6 +190,7 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "command_name": "twist",
             "std": 0.30,
             "upright_std": 0.25,
+            "neck_std": 0.20,
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
@@ -328,7 +339,7 @@ def make_microduck_ballet_env_cfg(play: bool = False):
 
 
 MicroduckBalletRlCfg = deepcopy(MicroduckBallKickRlCfg)
-MicroduckBalletRlCfg.experiment_name = "ballet_right_support_pirouette_a1"
-MicroduckBalletRlCfg.run_name = "ballet_right_support_pirouette_a1"
+MicroduckBalletRlCfg.experiment_name = "ballet_right_support_pirouette_a2_head_up"
+MicroduckBalletRlCfg.run_name = "ballet_right_support_pirouette_a2_head_up"
 MicroduckBalletRlCfg.max_iterations = 6_000
 MicroduckBalletRlCfg.algorithm.symmetry_cfg = None

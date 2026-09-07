@@ -5302,6 +5302,7 @@ def ballet_turn_rate_track(
     command_name: str = "twist",
     std: float = 0.45,
     upright_std: float | None = None,
+    neck_std: float | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Track commanded trunk yaw rate, including a zero-rate unwind.
@@ -5316,15 +5317,25 @@ def ballet_turn_rate_track(
     target = torch.where(active, commanded, torch.zeros_like(commanded))
     omega_z = asset.data.root_link_ang_vel_b[:, 2]
     rate_score = torch.exp(-(((omega_z - target) / std) ** 2))
-    if upright_std is None:
-        return rate_score
+    posture_score = torch.ones_like(rate_score)
+    if upright_std is not None:
+        # A policy that reaches the requested yaw rate by leaning and thrashing
+        # must not receive the full turning reward.
+        quat = asset.data.root_link_quat_w
+        tilt_sq = 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+        posture_score *= torch.exp(-tilt_sq / (upright_std * upright_std))
 
-    # Couple task success to posture: a policy that reaches the requested yaw
-    # rate by leaning and thrashing must not receive the full turning reward.
-    quat = asset.data.root_link_quat_w
-    tilt_sq = 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
-    upright_score = torch.exp(-tilt_sq / (upright_std * upright_std))
-    return rate_score * upright_score
+    if neck_std is not None:
+        # RMS-style composite, rather than a mean of four independent rewards:
+        # folding the two pitch joints can no longer hide behind correct
+        # head-yaw/head-roll values.  The neck may not act as a counterweight.
+        neck_indices = [5, 6, 7, 8]
+        neck_pos = _servo_joint_pos(env, asset)[:, neck_indices]
+        neck_default = _servo_default_joint_pos(env, asset)[:, neck_indices]
+        neck_error_sq = torch.mean(torch.square(neck_pos - neck_default), dim=1)
+        posture_score *= torch.exp(-neck_error_sq / (neck_std * neck_std))
+
+    return rate_score * posture_score
 
 
 def ballet_turn_rate_l1(
