@@ -115,18 +115,24 @@ def test_turn_rate_tracks_command_and_brakes_during_unwind():
         scene={"robot": robot},
     )
 
-    track = microduck_mdp.ballet_turn_rate_track(env, upright_std=0.25)
+    track = microduck_mdp.ballet_turn_rate_track(env, std=0.30, upright_std=0.25)
     assert track.item() == 1.0
     assert microduck_mdp.ballet_turn_rate_l1(env).item() == 0.0
 
     robot.data.root_link_quat_w[:] = torch.tensor([[0.9848, 0.1736, 0.0, 0.0]])
-    assert microduck_mdp.ballet_turn_rate_track(env, upright_std=0.25).item() < 0.4
+    tilted_track = microduck_mdp.ballet_turn_rate_track(
+        env, std=0.30, upright_std=0.25
+    )
+    assert tilted_track.item() < 0.4
     robot.data.root_link_quat_w[:] = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
 
     command[:, 0] = 0.0
-    assert microduck_mdp.ballet_turn_rate_track(env, upright_std=0.25).item() < 0.2
+    braking_track = microduck_mdp.ballet_turn_rate_track(
+        env, std=0.30, upright_std=0.25
+    )
+    assert braking_track.item() < 0.2
     robot.data.root_link_ang_vel_b[:, 2] = 0.0
-    track = microduck_mdp.ballet_turn_rate_track(env, upright_std=0.25)
+    track = microduck_mdp.ballet_turn_rate_track(env, std=0.30, upright_std=0.25)
     assert track.item() == 1.0
 
 
