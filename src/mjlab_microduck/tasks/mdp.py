@@ -5141,17 +5141,21 @@ class BalletCommand(UniformVelocityCommand):
     - ``active=0``: land and return to the two-foot HOME stand;
     - ``free_leg_side=+1``: left leg is free (right leg supports).
 
-    Resampling the flag mid-episode is load-bearing: robotd switches to the
-    idle command when a skill window expires, which may happen at any rotation
-    phase.  Training only active episodes would make that unwind an
-    out-of-distribution transition.
+    The first phase is random and later phases alternate TURN/IDLE.  This is
+    load-bearing: every finite turn is followed by the brake-and-land command,
+    while random dwell durations expose the policy to different stop angles.
     """
 
     def __init__(self, cfg, env: ManagerBasedRlEnv):
         super().__init__(cfg, env)
-        self._active_prob = float(getattr(cfg, "active_prob", 0.65))
         self._free_leg_side = float(getattr(cfg, "free_leg_side", 1.0))
         self._turn = float(getattr(cfg, "turn", 0.0))
+        # Randomise only the first phase; after that every environment must
+        # alternate finite TURN and IDLE windows.  Independent random starts
+        # plus random dwell durations keep the parallel environments decorrelated.
+        self._next_active = torch.rand(
+            self.num_envs, device=self.device
+        ) < 0.5
 
     @property
     def command(self) -> torch.Tensor:
@@ -5161,7 +5165,8 @@ class BalletCommand(UniformVelocityCommand):
         n = len(env_ids)
         if n == 0:
             return
-        active = (torch.rand(n, device=self.device) < self._active_prob).float()
+        active = self._next_active[env_ids].float()
+        self._next_active[env_ids] = ~self._next_active[env_ids]
         self.vel_command_b[env_ids, 0] = active
         self.vel_command_b[env_ids, 1] = self._free_leg_side
         # Match deployment's unwind command exactly: inactive means no turn.
@@ -5191,7 +5196,6 @@ class BalletCommand(UniformVelocityCommand):
 @_dataclass(kw_only=True)
 class BalletCommandCfg(VelocityCommandCommandOnlyCfg):
     class_type: type = BalletCommand
-    active_prob: float = 0.65
     free_leg_side: float = 1.0
     turn: float = 0.0
 
@@ -5297,6 +5301,7 @@ def ballet_turn_rate_track(
     env: ManagerBasedRlEnv,
     command_name: str = "twist",
     std: float = 0.45,
+    upright_std: float | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Track commanded trunk yaw rate, including a zero-rate unwind.
@@ -5310,7 +5315,16 @@ def ballet_turn_rate_track(
     commanded = env.command_manager.get_command(command_name)[:, 2]
     target = torch.where(active, commanded, torch.zeros_like(commanded))
     omega_z = asset.data.root_link_ang_vel_b[:, 2]
-    return torch.exp(-(((omega_z - target) / std) ** 2))
+    rate_score = torch.exp(-(((omega_z - target) / std) ** 2))
+    if upright_std is None:
+        return rate_score
+
+    # Couple task success to posture: a policy that reaches the requested yaw
+    # rate by leaning and thrashing must not receive the full turning reward.
+    quat = asset.data.root_link_quat_w
+    tilt_sq = 2.0 * (quat[:, 1] ** 2 + quat[:, 2] ** 2)
+    upright_score = torch.exp(-tilt_sq / (upright_std * upright_std))
+    return rate_score * upright_score
 
 
 def ballet_turn_rate_l1(

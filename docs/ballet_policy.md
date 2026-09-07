@@ -2,8 +2,8 @@
 
 `Mjlab-Ballet-Flat-MicroDuck` is the first training scaffold for a ballet-like
 one-legged pirouette. It is intentionally narrow: the right leg remains the
-support/pivot leg, the left leg is the display leg, and the commanded turn is
-a moderate counter-clockwise 0.8 rad/s.
+support/pivot leg, the left leg is the display leg, and each commanded turn is
+a counter-clockwise 0.4 rad/s for 2.0-2.6 seconds (about 46-60 degrees).
 
 ## Command and deployment contract
 
@@ -14,20 +14,19 @@ twist values mean:
 [active, free_leg_side, turn]
 ```
 
-- `[1, 1, 0.8]` lifts the left leg and tracks a 0.8 rad/s yaw rate.
+- `[1, 1, 0.4]` lifts the left leg and tracks a 0.4 rad/s yaw rate.
 - `[0, 1, 0]` asks the same policy to land and return to the two-foot HOME pose.
 
-The active flag is resampled every 3–6 seconds in training. This is deliberate:
-robotd may begin the unwind at any rotation phase. A policy that only saw
-episode-boundary stops would not have learned to brake, lower the display leg
-and return to HOME from a moving state.
+TURN and IDLE windows alternate every 2.0-2.6 seconds in training. Thus every
+finite turn is followed by a learned brake, leg lowering, and HOME recovery.
+Random window lengths prevent the policy from memorising one exact stop angle.
 
 After exporting `ballet.onnx`, a local file can be installed as a generic
-perpetual skill without adding a new daemon RPC:
+timed skill without adding a new daemon RPC:
 
 ```bash
 sudo robotctl policy add ballet /path/to/ballet.onnx \
-  --hold 5 --command 1,1,0.8 \
+  --hold 2.3 --command 1,1,0.4 \
   --unwind 2.5 --unwind-command 0,1,0
 robotctl robot do ballet
 ```
@@ -44,18 +43,22 @@ its constant-gradient L1 bootstrap turn on; the main tracking reward reaches
 full weight at iteration 600:
 
 ```text
-right-foot support + left foot raised + trunk yaw rate near 0.8 rad/s
+right-foot support + left foot raised + trunk yaw rate near 0.4 rad/s
 ```
 
 The same rate objective targets exactly zero when the command switches off, so
-braking is trained rather than left to a fixed timeout. A weak planar-velocity
+braking is trained rather than left to a fixed timeout. Turning credit is also
+multiplied by an upright-posture score, preventing lean-and-thrash shortcuts.
+A weak planar-velocity
 cost discourages travelling across the floor, while leaving enough freedom for
 the trunk to orbit slightly around the offset support foot. The all-axis angular
 momentum penalty is removed because it would directly oppose yaw rotation.
 
 Existing BallKick curricula continue to phase in CoM/head-CoM randomization and
-pushes. Ballet caps the final action-rate penalty at -0.5 instead of -1.0 so the
-balance corrections and yaw-generating motion remain economically viable.
+pushes. From iteration 600 onward, upright and body-angular-velocity constraints
+tighten and a small leg-action-acceleration penalty is introduced. Ballet caps
+the final action-rate penalty at -0.5 so necessary balance and yaw corrections
+remain viable without rewarding high-frequency jitter.
 
 ```bash
 # Cheap configuration/runtime smoke test first.
