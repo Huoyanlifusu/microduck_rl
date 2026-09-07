@@ -504,6 +504,21 @@ def neck_action_acceleration_l2(
     return torch.sum(torch.square(action_acc), dim=1)
 
 
+def joint_action_l2(
+    env: ManagerBasedRlEnv,
+    joint_indices: list[int],
+) -> torch.Tensor:
+    """Penalize normalized policy outputs for a selected actuator group.
+
+    A zero joint-position action maps to the model's default/HOME target. This
+    catches constant non-zero commands that an action-rate cost cannot see.
+    """
+    if not hasattr(env, "action_manager"):
+        return torch.zeros(env.num_envs, device=env.device)
+    actions = env.action_manager.action
+    return torch.sum(torch.square(actions[:, joint_indices]), dim=1)
+
+
 def _fallen_mask(
     env: ManagerBasedRlEnv,
     asset,
@@ -5197,6 +5212,27 @@ class BalletCommandCfg(VelocityCommandCommandOnlyCfg):
         return BalletCommand(self, env)
 
 
+def ballet_turn_command_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    turn_stages: list[dict],
+) -> torch.Tensor:
+    """Keep the observed turn command synchronized with its reward stages."""
+    del env_ids
+    turn = float(turn_stages[0]["turn"])
+    for stage in turn_stages:
+        if env.common_step_counter > stage["step"]:
+            turn = float(stage["turn"])
+
+    term = env.command_manager.get_term(command_name)
+    assert isinstance(term, BalletCommand)
+    term._turn = turn
+    term.cfg.turn = turn
+    term.vel_command_b[:, 2] = turn
+    return torch.tensor([turn], device=env.device)
+
+
 def _ballet_active(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
     return env.command_manager.get_command(command_name)[:, 0] > 0.5
 
@@ -5297,6 +5333,42 @@ def ballet_com_over_support_l1(
     return -distance * _ballet_active(env, command_name).float()
 
 
+def ballet_trunk_over_support(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.04,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("right_foot",)
+    ),
+) -> torch.Tensor:
+    """Place the trunk-base projection over the support foot.
+
+    Whole-robot CoM can be shifted by swinging the heavy head. Trunk position
+    cannot, so this term explicitly trains the required hip/pelvis transfer.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    trunk_xy = asset.data.root_link_pos_w[:, :2]
+    foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids[0], :2]
+    dist_sq = torch.sum(torch.square(trunk_xy - foot_xy), dim=1)
+    score = torch.exp(-dist_sq / (std * std))
+    return score * _ballet_active(env, command_name).float()
+
+
+def ballet_trunk_over_support_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("right_foot",)
+    ),
+) -> torch.Tensor:
+    """Constant-gradient companion to :func:`ballet_trunk_over_support`."""
+    asset: Entity = env.scene[asset_cfg.name]
+    trunk_xy = asset.data.root_link_pos_w[:, :2]
+    foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids[0], :2]
+    distance = torch.linalg.vector_norm(trunk_xy - foot_xy, dim=1)
+    return -distance * _ballet_active(env, command_name).float()
+
+
 def ballet_commanded_pose(
     env: ManagerBasedRlEnv,
     when_active: bool,
@@ -5319,6 +5391,36 @@ def ballet_commanded_pose_l1(
     active = _ballet_active(env, command_name)
     gate = active if when_active else ~active
     return pose_l1_penalty(env, **pose_kwargs) * gate.float()
+
+
+def ballet_home_pose_l1_when_not_turning(
+    env: ManagerBasedRlEnv,
+    joint_indices: list[int],
+    command_name: str = "twist",
+    threshold: float = 1.0e-4,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Hold selected joints at HOME until a body turn is commanded."""
+    turn = env.command_manager.get_command(command_name)[:, 2]
+    gate = torch.abs(turn) <= threshold
+    return pose_l1_penalty(
+        env,
+        joint_indices=joint_indices,
+        target_overrides=None,
+        asset_cfg=asset_cfg,
+    ) * gate.float()
+
+
+def ballet_joint_action_l2_when_not_turning(
+    env: ManagerBasedRlEnv,
+    joint_indices: list[int],
+    command_name: str = "twist",
+    threshold: float = 1.0e-4,
+) -> torch.Tensor:
+    """Suppress selected policy outputs until body turning is enabled."""
+    turn = env.command_manager.get_command(command_name)[:, 2]
+    gate = torch.abs(turn) <= threshold
+    return joint_action_l2(env, joint_indices) * gate.float()
 
 
 def ballet_commanded_height(
@@ -5346,6 +5448,8 @@ def ballet_turn_rate_track(
     std: float = 0.45,
     upright_std: float | None = None,
     neck_std: float | None = None,
+    support_sensor: str | None = None,
+    free_sensor: str | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
     """Track commanded trunk yaw rate, including a zero-rate unwind.
@@ -5377,6 +5481,11 @@ def ballet_turn_rate_track(
         neck_default = _servo_default_joint_pos(env, asset)[:, neck_indices]
         neck_error_sq = torch.mean(torch.square(neck_pos - neck_default), dim=1)
         posture_score *= torch.exp(-neck_error_sq / (neck_std * neck_std))
+
+    if support_sensor is not None and free_sensor is not None:
+        support = _contact_found(env, support_sensor)
+        free = _contact_found(env, free_sensor)
+        posture_score *= (support & ~free).float()
 
     return rate_score * posture_score
 

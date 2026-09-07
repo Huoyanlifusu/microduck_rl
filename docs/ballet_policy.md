@@ -1,9 +1,9 @@
-# Ballet V1 policy (A3)
+# Ballet V1 policy (A4)
 
 `Mjlab-Ballet-Flat-MicroDuck` is the first training scaffold for a ballet-like
 one-legged pirouette. It is intentionally narrow: the right leg remains the
-support/pivot leg, the left leg is the display leg, and A3 prioritizes learning
-a stable one-leg pose before introducing yaw.
+support/pivot leg, the left leg is the display leg, and A4 assigns every one of
+the 14 joints an explicit role before introducing body yaw.
 
 ## Command and deployment contract
 
@@ -14,18 +14,16 @@ twist values mean:
 [active, free_leg_side, turn]
 ```
 
-A3 trains the fixed command `[1, 1, 0.4]` for each full 12-second episode:
-active skill, left leg free, right leg supporting, and a target yaw rate of
-0.4 rad/s. There is no TURN/IDLE resampling. At deployment the runtime holds
-this policy for a measured duration and then switches back to the normal
-standing policy. A 2.0-2.6 second hold would request about 46-60 degrees once
-the turn has converged.
+A4 holds `[1, 1, 0]` through iteration 1200, then changes both the observed
+command and its reward to 0.2 rad/s, reaching `[1, 1, 0.4]` at iteration 1600.
+There is no TURN/IDLE resampling. At deployment the runtime holds this policy
+for a measured duration and then switches back to the normal standing policy.
 
-The four neck/head actions remain in the shared 14-action output, but Ballet
-A3 holds them at HOME throughout the episode. The turn reward is multiplied by a
-strict four-joint neck-pose score, so lowering the head as a counterweight can
-no longer be traded for yaw reward. Dense trunk-height and upright terms likewise
-prevent a deep crouch. This is still a planted-right-foot pirouette, not a
+The four neck/head actions remain in the shared 14-action output, but position,
+raw action and velocity penalties hold them at HOME. The turn reward is also
+multiplied by strict neck, upright and one-foot-contact gates. Dense trunk-height
+and upright terms prevent a deep crouch. This is a planted-right-foot
+pirouette, not a
 jump: loss of support-foot contact remains a violation.
 
 After exporting `ballet.onnx`, install it as a timed skill. The exact command
@@ -39,7 +37,17 @@ standing policy -> ballet.onnx + [1, 1, 0.4] for a short hold -> standing policy
 The timing above is illustrative. Measure it in simulation and on a supported
 robot before treating it as a deployment value.
 
-## Why A3 adds weight transfer
+## Joint roles
+
+| Action indices | Joints | Role |
+|---|---|---|
+| 0 | left hip-yaw | Hold HOME; opening it is unnecessary |
+| 1-4 | left roll/pitch/knee/ankle | Form and hold the lifted-leg pose |
+| 5-8 | neck/head | Hold HOME; never generate body yaw with the head |
+| 9 | right hip-yaw | Hold HOME before iteration 1200; body-turn actuator afterwards |
+| 10-13 | right roll/pitch/knee/ankle | Free only for support and balance |
+
+## Why A4 targets trunk transfer
 
 Forward kinematics of the original free-leg joint target showed that the left
 foot can reach its requested height, but the whole-robot CoM remains about
@@ -48,19 +56,19 @@ reported success after the foot had lifted; it gave no direction for the
 preceding lateral weight shift. A2 therefore learned to stand straighter by
 sacrificing the leg lift.
 
-A3 adds a Gaussian reward for accurate final CoM placement and an L1 companion
-that keeps a useful gradient while the CoM is still far away. The same pattern
-is used for trunk height and the free-leg pose. Neck reward is reduced so it
-cannot dominate the actual one-leg task.
+A3's whole-robot CoM reward could be improved by moving Microduck's heavy head.
+A4 replaces it with Gaussian and L1 rewards that place the trunk-base projection
+over the right foot. This requires hip/pelvis translation rather than head
+swinging. The same dense pattern remains for trunk height and free-leg pose.
 
 ## Training progression
 
-Iterations 0-799 train right-foot support, lateral CoM transfer, left-foot
+Iterations 0-1199 train right-foot support, lateral trunk transfer, left-foot
 clearance, the free-leg pose, standing height and upright posture. Losing
 right-foot contact or touching down with the left foot is explicitly penalised.
-Yaw reward is exactly zero in this phase. At iteration 800 yaw-rate tracking
-and its constant-gradient L1 bootstrap turn on; the main tracking reward
-reaches full weight at iteration 1200:
+Both observed turn command and yaw reward are exactly zero in this phase. At
+iteration 1200 they synchronously turn on at 0.2 rad/s; at iteration 1600 the
+command reaches 0.4 rad/s and the main tracking reward reaches full weight:
 
 ```text
 right-foot support + left foot raised + trunk yaw rate near 0.4 rad/s
@@ -73,9 +81,8 @@ the trunk to orbit slightly around the offset support foot. The all-axis angular
 momentum penalty is removed because it would directly oppose yaw rotation.
 
 Stronger CoM/head-CoM randomization and pushes are delayed until after the
-one-leg pose and first turn stage. From iteration 800 onward, upright and
-body-angular-velocity constraints tighten; action smoothing is introduced
-progressively from iteration 800 onward. Ballet caps
+one-leg pose and first turn stage. Posture and action smoothing also tighten
+only after the initial single-support behavior forms. Ballet caps
 the final action-rate penalty at -0.5 so necessary balance and yaw corrections
 remain viable without rewarding high-frequency jitter.
 
@@ -96,9 +103,10 @@ uv run scripts/export.py Mjlab-Ballet-Flat-MicroDuck \
   --wandb-run-path <entity/project/run_id> --onnx-file ballet.onnx
 ```
 
-Watch `com_over_support`, `com_over_support_l1`, `free_foot_height`,
+Watch `trunk_over_support`, `trunk_over_support_l1`, `free_foot_height`,
 `free_leg_pose`, `unique_support`, `height_stand_l1`, `upright_linear`, contact
-violation and fall rate. Before iteration 800, yaw reward should remain zero.
+violation, neck penalties and fall rate. Before iteration 1200, both
+`Curriculum/turn_command` and yaw reward must remain zero.
 
 ## What V1 does not claim
 

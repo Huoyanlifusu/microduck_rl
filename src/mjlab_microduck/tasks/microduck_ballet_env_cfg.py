@@ -4,11 +4,10 @@ This is deliberately a one-leg-hold-first skill with a timed deployment turn:
 
     twist = [active, free_leg_side, turn]
 
-V1 fixes ``free_leg_side=+1`` (left leg lifted, right leg supporting) and asks
-for 0.4 rad/s: about 46-60 degrees when deployed for 2.0-2.6 seconds.  Training
-holds ``active=1`` for the
-whole episode: it first learns weight transfer and a clean one-leg pose, then
-learns yaw.  The runtime switches back to a standing policy after the skill.
+V1 fixes ``free_leg_side=+1`` (left leg lifted, right leg supporting). A4 holds
+the observed turn command at zero through iteration 1200, then synchronously
+ramps command and reward to 0.2 and 0.4 rad/s. The runtime switches back to a
+standing policy after the timed skill.
 
 The environment is derived from BallKick rather than rebuilt from mjlab's
 base.  BallKick is the closest proven sim2real recipe: full ground-contact
@@ -39,6 +38,8 @@ from mjlab_microduck.tasks.microduck_ball_kick_env_cfg import (
 EPISODE_LENGTH_S = 12.0
 COMMAND_DWELL_S = (EPISODE_LENGTH_S, EPISODE_LENGTH_S)
 TURN_RATE = 0.4
+TURN_START_ITER = 1200
+TURN_FULL_ITER = 1600
 
 # Left leg is the free/display leg; the right leg is the support/pivot leg.
 FREE_LEG_SIDE = 1.0
@@ -52,11 +53,33 @@ FREE_FOOT_Z = 0.055
 
 _FREE_LEG_JOINTS = [0, 1, 2, 3, 4]
 _NECK_JOINTS = [5, 6, 7, 8]
+_FREE_HIP_YAW = [0]
+_SUPPORT_HIP_YAW = [9]
+
+# Actuator order is the deployed 14D action order.  This table is deliberately
+# exhaustive: every joint is either assigned an intended role or explicitly
+# held at HOME.  The support-leg balance joints remain free because lateral
+# weight transfer cannot be achieved with a rigid support chain.
+BALLET_JOINT_ROLES = (
+    (0, "left_hip_yaw", "hold_home"),
+    (1, "left_hip_roll", "free_leg_pose"),
+    (2, "left_hip_pitch", "free_leg_pose"),
+    (3, "left_knee", "free_leg_pose"),
+    (4, "left_ankle", "free_leg_pose"),
+    (5, "neck_pitch", "hold_home"),
+    (6, "head_pitch", "hold_home"),
+    (7, "head_yaw", "hold_home"),
+    (8, "head_roll", "hold_home"),
+    (9, "right_hip_yaw", "body_turn_only"),
+    (10, "right_hip_roll", "support_balance"),
+    (11, "right_hip_pitch", "support_balance"),
+    (12, "right_knee", "support_balance"),
+    (13, "right_ankle", "support_balance"),
+)
 
 # A readable lifted-leg silhouette, not a human anatomical ballet pose.  The
 # support leg is deliberately omitted so it remains free to balance and pivot.
 FREE_LEG_TARGET = {
-    0: 0.10,   # hip yaw: open the free leg slightly
     1: -0.25,  # hip roll: move it away from the support leg
     2: -0.75,  # hip pitch
     3: 0.85,   # flex knee for ground clearance
@@ -93,8 +116,9 @@ def make_microduck_ballet_env_cfg(play: bool = False):
     )
     cfg.scene.sensors = (*cfg.scene.sensors, free_foot_ground)
 
-    # One command for the whole episode.  No TURN/IDLE resampling: A3 first
-    # solves weight transfer + one-leg hold, then introduces yaw by curriculum.
+    # The observed turn command starts at zero and is raised by curriculum at
+    # exactly the same steps as the turn rewards.  The policy never receives a
+    # latent turn request while it is supposed to learn pure single support.
     command = cfg.commands["twist"]
     command.rel_standing_envs = 0.0
     command.rel_heading_envs = 0.0
@@ -107,7 +131,7 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             **vars(command),
             "active": 1.0,
             "free_leg_side": FREE_LEG_SIDE,
-            "turn": TURN_RATE,
+            "turn": 0.0,
         }
     )
 
@@ -131,11 +155,26 @@ def make_microduck_ballet_env_cfg(play: bool = False):
     ):
         cfg.rewards.pop(name, None)
 
-    # Keep the head near HOME without making it a large independently farmable
-    # jackpot.  Turn reward later multiplies by a stricter neck-pose score.
+    # The neck is not an actuator for this skill.  Gaussian pose accuracy plus
+    # L1 position, raw-action and velocity costs reject both a static head
+    # counterweight and the rotating-head shortcut seen in model_750.pt.
     cfg.rewards["pose_stand_neck"].weight = 1.5
     cfg.rewards["pose_stand_neck"].params.update(
         {"std": 0.20, "joint_indices": _NECK_JOINTS}
+    )
+    cfg.rewards["neck_home_l1"] = RewardTermCfg(
+        func=microduck_mdp.pose_l1_penalty,
+        weight=3.0,
+        params={"joint_indices": _NECK_JOINTS, "target_overrides": None},
+    )
+    cfg.rewards["neck_action_l2"] = RewardTermCfg(
+        func=microduck_mdp.joint_action_l2,
+        weight=-0.20,
+        params={"joint_indices": _NECK_JOINTS},
+    )
+    cfg.rewards["neck_joint_vel_l2"] = RewardTermCfg(
+        func=microduck_mdp.neck_joint_vel_l2,
+        weight=-0.02,
     )
     cfg.rewards["height_stand"].weight = 2.0
     cfg.rewards["height_stand"].params["std"] = 0.04
@@ -163,14 +202,13 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "command_name": "twist",
         },
     )
-    # The missing ingredient in A1/A2: the kinematic target leaves the CoM
-    # about 49 mm inside the right foot.  Give the policy a dense direction for
-    # shifting its pelvis before the binary unique-support condition can score.
+    # Direct the trunk/pelvis over the support foot.  A3 rewarded whole-robot
+    # CoM, which could be improved by moving the head instead of the hips.
     support_site_cfg = SceneEntityCfg(
         "robot", site_names=(SUPPORT_FOOT_SITE,)
     )
-    cfg.rewards["com_over_support"] = RewardTermCfg(
-        func=microduck_mdp.ballet_com_over_support,
+    cfg.rewards["trunk_over_support"] = RewardTermCfg(
+        func=microduck_mdp.ballet_trunk_over_support,
         weight=3.0,
         params={
             "command_name": "twist",
@@ -178,8 +216,8 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "asset_cfg": support_site_cfg,
         },
     )
-    cfg.rewards["com_over_support_l1"] = RewardTermCfg(
-        func=microduck_mdp.ballet_com_over_support_l1,
+    cfg.rewards["trunk_over_support_l1"] = RewardTermCfg(
+        func=microduck_mdp.ballet_trunk_over_support_l1,
         weight=10.0,
         params={"command_name": "twist", "asset_cfg": support_site_cfg},
     )
@@ -223,6 +261,35 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "target_overrides": FREE_LEG_TARGET,
         },
     )
+    # These two hip-yaw joints have distinct roles: the free hip-yaw never
+    # participates, while the support hip-yaw is released only with the turn
+    # command.  All other leg joints are necessary for pose or balance.
+    cfg.rewards["free_hip_yaw_home_l1"] = RewardTermCfg(
+        func=microduck_mdp.pose_l1_penalty,
+        weight=2.0,
+        params={"joint_indices": _FREE_HIP_YAW, "target_overrides": None},
+    )
+    cfg.rewards["free_hip_yaw_action_l2"] = RewardTermCfg(
+        func=microduck_mdp.joint_action_l2,
+        weight=-0.20,
+        params={"joint_indices": _FREE_HIP_YAW},
+    )
+    cfg.rewards["support_hip_yaw_home_l1"] = RewardTermCfg(
+        func=microduck_mdp.ballet_home_pose_l1_when_not_turning,
+        weight=2.0,
+        params={
+            "joint_indices": _SUPPORT_HIP_YAW,
+            "command_name": "twist",
+        },
+    )
+    cfg.rewards["support_hip_yaw_action_l2"] = RewardTermCfg(
+        func=microduck_mdp.ballet_joint_action_l2_when_not_turning,
+        weight=-0.20,
+        params={
+            "joint_indices": _SUPPORT_HIP_YAW,
+            "command_name": "twist",
+        },
+    )
 
     # Pirouette objective.  Track yaw rate directly rather than prescribing a
     # joint trajectory; the L1 companion keeps a useful gradient before the
@@ -235,6 +302,8 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "std": 0.30,
             "upright_std": 0.25,
             "neck_std": 0.20,
+            "support_sensor": SUPPORT_SENSOR,
+            "free_sensor": FREE_SENSOR,
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk_base",)),
         },
     )
@@ -278,16 +347,27 @@ def make_microduck_ballet_env_cfg(play: bool = False):
     cfg.rewards["upright"].weight = 2.0
     cfg.rewards["body_ang_vel"].weight = -0.05
 
-    # Give the one-leg pose 800 iterations to consolidate before asking for
-    # yaw.  A1/A2 introduced turning at 300 while the robot was still crouched.
+    # A4 gives deterministic single support substantially longer to settle.
+    # Crucially, the observed command and both reward terms change together.
+    cfg.curriculum["turn_command"] = CurriculumTermCfg(
+        func=microduck_mdp.ballet_turn_command_curriculum,
+        params={
+            "command_name": "twist",
+            "turn_stages": [
+                {"step": 0, "turn": 0.0},
+                {"step": TURN_START_ITER * 24, "turn": 0.2},
+                {"step": TURN_FULL_ITER * 24, "turn": TURN_RATE},
+            ],
+        },
+    )
     cfg.curriculum["turn_rate_track_weight"] = CurriculumTermCfg(
         func=microduck_mdp.reward_weight,
         params={
             "reward_name": "turn_rate_track",
             "weight_stages": [
                 {"step": 0, "weight": 0.0},
-                {"step": 800 * 24, "weight": 3.0},
-                {"step": 1200 * 24, "weight": 6.0},
+                {"step": TURN_START_ITER * 24, "weight": 3.0},
+                {"step": TURN_FULL_ITER * 24, "weight": 6.0},
             ],
         },
     )
@@ -297,8 +377,8 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "reward_name": "turn_rate_l1",
             "weight_stages": [
                 {"step": 0, "weight": 0.0},
-                {"step": 800 * 24, "weight": 0.5},
-                {"step": 1400 * 24, "weight": 0.25},
+                {"step": TURN_START_ITER * 24, "weight": 0.5},
+                {"step": 1800 * 24, "weight": 0.25},
             ],
         },
     )
@@ -309,8 +389,8 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "reward_name": "upright",
             "weight_stages": [
                 {"step": 0, "weight": 2.0},
-                {"step": 800 * 24, "weight": 3.0},
-                {"step": 1200 * 24, "weight": 4.0},
+                {"step": 1000 * 24, "weight": 3.0},
+                {"step": TURN_FULL_ITER * 24, "weight": 4.0},
             ],
         },
     )
@@ -320,8 +400,8 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "reward_name": "body_ang_vel",
             "weight_stages": [
                 {"step": 0, "weight": -0.05},
-                {"step": 800 * 24, "weight": -0.10},
-                {"step": 1200 * 24, "weight": -0.20},
+                {"step": 1000 * 24, "weight": -0.10},
+                {"step": TURN_FULL_ITER * 24, "weight": -0.20},
             ],
         },
     )
@@ -331,8 +411,8 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "reward_name": "leg_action_acceleration",
             "weight_stages": [
                 {"step": 0, "weight": 0.0},
-                {"step": 1000 * 24, "weight": -0.02},
-                {"step": 1400 * 24, "weight": -0.05},
+                {"step": 1400 * 24, "weight": -0.02},
+                {"step": 1800 * 24, "weight": -0.05},
             ],
         },
     )
@@ -345,9 +425,9 @@ def make_microduck_ballet_env_cfg(play: bool = False):
             "reward_name": "action_rate_l2",
             "weight_stages": [
                 {"step": 0, "weight": -0.1},
-                {"step": 800 * 24, "weight": -0.2},
-                {"step": 1200 * 24, "weight": -0.35},
-                {"step": 1600 * 24, "weight": -0.5},
+                {"step": 1000 * 24, "weight": -0.2},
+                {"step": 1400 * 24, "weight": -0.35},
+                {"step": 1800 * 24, "weight": -0.5},
             ],
         },
     )
@@ -359,15 +439,15 @@ def make_microduck_ballet_env_cfg(play: bool = False):
     if "com_range" in cfg.curriculum:
         cfg.curriculum["com_range"].params["range_stages"] = [
             {"step": 0, "range": 0.003},
-            {"step": 1000 * 24, "range": 0.005},
-            {"step": 1400 * 24, "range": 0.01},
-            {"step": 2000 * 24, "range": 0.015},
+            {"step": 1600 * 24, "range": 0.005},
+            {"step": 2000 * 24, "range": 0.01},
+            {"step": 2600 * 24, "range": 0.015},
         ]
     if "head_com_range" in cfg.curriculum:
         cfg.curriculum["head_com_range"].params["range_stages"] = [
             {"step": 0, "range": 0.003},
-            {"step": 1000 * 24, "range": 0.005},
-            {"step": 1600 * 24, "range": 0.01},
+            {"step": 1800 * 24, "range": 0.005},
+            {"step": 2400 * 24, "range": 0.01},
         ]
     if "push_magnitude" in cfg.curriculum:
         cfg.curriculum["push_magnitude"].params["push_stages"] = [
@@ -376,14 +456,14 @@ def make_microduck_ballet_env_cfg(play: bool = False):
                 "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)},
             },
             {
-                "step": 1200 * 24,
+                "step": 1800 * 24,
                 "velocity_range": {
                     "x": (-0.08, 0.08),
                     "y": (-0.08, 0.08),
                 },
             },
             {
-                "step": 2000 * 24,
+                "step": 2600 * 24,
                 "velocity_range": {
                     "x": VELOCITY_PUSH_RANGE,
                     "y": VELOCITY_PUSH_RANGE,
@@ -395,7 +475,7 @@ def make_microduck_ballet_env_cfg(play: bool = False):
 
 
 MicroduckBalletRlCfg = deepcopy(MicroduckBallKickRlCfg)
-MicroduckBalletRlCfg.experiment_name = "ballet_right_support_pirouette_a3_com_shift"
-MicroduckBalletRlCfg.run_name = "ballet_right_support_pirouette_a3_com_shift"
+MicroduckBalletRlCfg.experiment_name = "ballet_right_support_pirouette_a4_joint_roles"
+MicroduckBalletRlCfg.run_name = "ballet_right_support_pirouette_a4_joint_roles"
 MicroduckBalletRlCfg.max_iterations = 6_000
 MicroduckBalletRlCfg.algorithm.symmetry_cfg = None
