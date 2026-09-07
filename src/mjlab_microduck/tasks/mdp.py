@@ -5131,31 +5131,27 @@ def zero_command_padding(
 
 
 class BalletCommand(UniformVelocityCommand):
-    """Binary ballet command carried in the shared three-value twist slot.
+    """Fixed active ballet command carried in the shared twist slot.
 
     The wire/runtime contract is ``[active, free_leg_side, turn]``.  V1 trains
     one side and one moderate turn rate, while keeping all three values
     explicit so the exported policy can be installed as a generic robotd skill:
 
     - ``active=1``: lift the configured free leg and track the commanded turn;
-    - ``active=0``: land and return to the two-foot HOME stand;
     - ``free_leg_side=+1``: left leg is free (right leg supports).
 
-    The first phase is random and later phases alternate TURN/IDLE.  This is
-    load-bearing: every finite turn is followed by the brake-and-land command,
-    while random dwell durations expose the policy to different stop angles.
+    A3 deliberately does not alternate TURN and IDLE.  Every episode starts
+    from HOME with ``active=1`` and learns one task: transfer weight to the
+    right foot, lift the left leg and hold it.  Deployment returns to the
+    standing policy after the timed skill instead of asking this policy to
+    learn a second, contradictory unwind task.
     """
 
     def __init__(self, cfg, env: ManagerBasedRlEnv):
         super().__init__(cfg, env)
+        self._active = float(getattr(cfg, "active", 1.0))
         self._free_leg_side = float(getattr(cfg, "free_leg_side", 1.0))
         self._turn = float(getattr(cfg, "turn", 0.0))
-        # Randomise only the first phase; after that every environment must
-        # alternate finite TURN and IDLE windows.  Independent random starts
-        # plus random dwell durations keep the parallel environments decorrelated.
-        self._next_active = torch.rand(
-            self.num_envs, device=self.device
-        ) < 0.5
 
     @property
     def command(self) -> torch.Tensor:
@@ -5165,12 +5161,9 @@ class BalletCommand(UniformVelocityCommand):
         n = len(env_ids)
         if n == 0:
             return
-        active = self._next_active[env_ids].float()
-        self._next_active[env_ids] = ~self._next_active[env_ids]
-        self.vel_command_b[env_ids, 0] = active
+        self.vel_command_b[env_ids, 0] = self._active
         self.vel_command_b[env_ids, 1] = self._free_leg_side
-        # Match deployment's unwind command exactly: inactive means no turn.
-        self.vel_command_b[env_ids, 2] = active * self._turn
+        self.vel_command_b[env_ids, 2] = self._turn
 
     def _update_command(self) -> None:
         pass
@@ -5196,6 +5189,7 @@ class BalletCommand(UniformVelocityCommand):
 @_dataclass(kw_only=True)
 class BalletCommandCfg(VelocityCommandCommandOnlyCfg):
     class_type: type = BalletCommand
+    active: float = 1.0
     free_leg_side: float = 1.0
     turn: float = 0.0
 
@@ -5266,6 +5260,43 @@ def ballet_free_foot_height(
     return score * _ballet_active(env, command_name).float()
 
 
+def ballet_com_over_support(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.04,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("right_foot",)
+    ),
+) -> torch.Tensor:
+    """Pull the horizontal whole-robot CoM over the support-foot site.
+
+    A binary contact reward only says whether the free foot has already left
+    the floor; it supplies no direction for the preceding weight transfer.
+    This dense term teaches that missing movement before the left leg lifts.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    com_xy = asset.data.root_com_pos_w[:, :2]
+    foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids[0], :2]
+    dist_sq = torch.sum(torch.square(com_xy - foot_xy), dim=1)
+    score = torch.exp(-dist_sq / (std * std))
+    return score * _ballet_active(env, command_name).float()
+
+
+def ballet_com_over_support_l1(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot", site_names=("right_foot",)
+    ),
+) -> torch.Tensor:
+    """Constant-gradient companion to :func:`ballet_com_over_support`."""
+    asset: Entity = env.scene[asset_cfg.name]
+    com_xy = asset.data.root_com_pos_w[:, :2]
+    foot_xy = asset.data.site_pos_w[:, asset_cfg.site_ids[0], :2]
+    distance = torch.linalg.vector_norm(com_xy - foot_xy, dim=1)
+    return -distance * _ballet_active(env, command_name).float()
+
+
 def ballet_commanded_pose(
     env: ManagerBasedRlEnv,
     when_active: bool,
@@ -5276,6 +5307,18 @@ def ballet_commanded_pose(
     active = _ballet_active(env, command_name)
     gate = active if when_active else ~active
     return pose_target_match(env, **pose_kwargs) * gate.float()
+
+
+def ballet_commanded_pose_l1(
+    env: ManagerBasedRlEnv,
+    when_active: bool,
+    command_name: str = "twist",
+    **pose_kwargs,
+) -> torch.Tensor:
+    """Gated constant-gradient pose companion for ballet transitions."""
+    active = _ballet_active(env, command_name)
+    gate = active if when_active else ~active
+    return pose_l1_penalty(env, **pose_kwargs) * gate.float()
 
 
 def ballet_commanded_height(

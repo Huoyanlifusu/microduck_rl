@@ -11,6 +11,7 @@ from mjlab_microduck.tasks.microduck_ballet_env_cfg import (
     FREE_LEG_SIDE,
     FREE_SENSOR,
     SUPPORT_SENSOR,
+    SUPPORT_FOOT_SITE,
     TURN_RATE,
     MicroduckBalletRlCfg,
     make_microduck_ballet_env_cfg,
@@ -21,9 +22,10 @@ def test_ballet_command_matches_the_runtime_skill_contract():
     cfg = make_microduck_ballet_env_cfg()
     cmd = cfg.commands["twist"]
     assert isinstance(cmd, microduck_mdp.BalletCommandCfg)
+    assert cmd.active == 1.0
     assert cmd.free_leg_side == FREE_LEG_SIDE == 1.0
     assert cmd.turn == TURN_RATE == 0.4
-    assert cmd.resampling_time_range == COMMAND_DWELL_S == (2.0, 2.6)
+    assert cmd.resampling_time_range == COMMAND_DWELL_S == (12.0, 12.0)
 
 
 def test_ballet_keeps_the_unified_actor_observation_layout():
@@ -45,7 +47,7 @@ def test_ballet_removes_the_ball_and_wires_both_feet():
     assert FREE_SENSOR in sensor_names
 
 
-def test_ballet_reward_stack_requires_one_leg_turn_and_safe_unwind():
+def test_ballet_reward_stack_prioritizes_weight_transfer_and_one_leg_hold():
     cfg = make_microduck_ballet_env_cfg()
     rewards = cfg.rewards
     for name in (
@@ -56,26 +58,39 @@ def test_ballet_reward_stack_requires_one_leg_turn_and_safe_unwind():
         "turn_rate_track",
         "turn_rate_l1",
         "planar_drift",
-        "idle_pose",
-        "idle_height",
         "gentle_transition",
         "leg_action_acceleration",
         "pose_stand_neck",
         "height_stand",
+        "height_stand_l1",
+        "upright_linear",
+        "com_over_support",
+        "com_over_support_l1",
+        "free_leg_pose_l1",
     ):
         assert name in rewards
     # trunk_vertical_accel_penalty is self-negating: positive weight is the
     # only sign that makes shocks costly.
     assert rewards["gentle_transition"].weight > 0.0
-    assert rewards["idle_pose"].params["when_active"] is False
+    assert "idle_pose" not in rewards
+    assert "idle_height" not in rewards
     assert rewards["turn_rate_track"].params["upright_std"] == 0.25
     assert rewards["turn_rate_track"].params["neck_std"] == 0.20
-    assert rewards["pose_stand_neck"].weight == 3.0
+    assert rewards["pose_stand_neck"].weight == 1.5
     assert rewards["pose_stand_neck"].params["joint_indices"] == [5, 6, 7, 8]
     assert rewards["height_stand"].weight == 2.0
-    assert rewards["height_stand"].params["std"] == 0.035
+    assert rewards["height_stand"].params["std"] == 0.04
+    assert rewards["height_stand_l1"].weight == 20.0
+    assert rewards["upright_linear"].weight == 2.0
+    assert rewards["com_over_support"].weight == 3.0
+    assert rewards["com_over_support"].params["std"] == 0.04
+    assert rewards["com_over_support"].params["asset_cfg"].site_names == (
+        SUPPORT_FOOT_SITE,
+    )
+    assert rewards["com_over_support_l1"].weight == 10.0
     assert rewards["free_foot_height"].weight == 2.5
     assert rewards["free_leg_pose"].weight == 2.5
+    assert rewards["free_leg_pose_l1"].weight == 1.0
     assert rewards["contact_violation"].weight == -2.0
     assert "angular_momentum" not in rewards
 
@@ -92,12 +107,46 @@ def test_turn_curriculum_starts_after_single_leg_balance():
     ]
     assert track[0]["weight"] == 0.0
     assert bootstrap[0]["weight"] == 0.0
+    assert track[1]["step"] == 800 * 24
+    assert bootstrap[1]["step"] == 800 * 24
+    assert action_rate[1]["step"] == 800 * 24
     assert track[-1]["weight"] == 6.0
     assert bootstrap[-1]["weight"] == 0.25
     assert action_rate[-1]["weight"] == -0.5
     assert upright[-1]["weight"] == 4.0
     assert body_ang_vel[-1]["weight"] == -0.2
     assert action_acc[-1]["weight"] == -0.05
+
+
+def test_com_over_support_supplies_dense_weight_transfer_direction():
+    command = torch.tensor([[1.0, 1.0, TURN_RATE]])
+    robot = SimpleNamespace(
+        data=SimpleNamespace(
+            root_com_pos_w=torch.tensor([[0.0, 0.0, 0.14]]),
+            site_pos_w=torch.tensor([[[0.0, 0.0, 0.01]]]),
+        )
+    )
+    env = SimpleNamespace(
+        command_manager=SimpleNamespace(get_command=lambda _: command),
+        scene={"robot": robot},
+    )
+    asset_cfg = SimpleNamespace(name="robot", site_ids=[0])
+
+    centered = microduck_mdp.ballet_com_over_support(env, asset_cfg=asset_cfg)
+    assert centered.item() == 1.0
+    assert microduck_mdp.ballet_com_over_support_l1(
+        env, asset_cfg=asset_cfg
+    ).item() == 0.0
+
+    robot.data.root_com_pos_w[:, 1] = 0.04
+    offset = microduck_mdp.ballet_com_over_support(
+        env, std=0.04, asset_cfg=asset_cfg
+    )
+    assert torch.isclose(offset, torch.exp(torch.tensor([-1.0]))).all()
+    offset_l1 = microduck_mdp.ballet_com_over_support_l1(
+        env, asset_cfg=asset_cfg
+    )
+    assert torch.isclose(offset_l1, torch.tensor([-0.04])).all()
 
 
 def test_ballet_is_asymmetric_and_has_a_backlash_build():
@@ -110,7 +159,7 @@ def test_ballet_is_asymmetric_and_has_a_backlash_build():
         assert terms["joint_vel"].func is microduck_mdp.joint_vel_rel_backlash
 
 
-def test_turn_rate_tracks_command_and_brakes_during_unwind():
+def test_turn_rate_tracks_active_command_and_retains_zero_target_fallback():
     command = torch.tensor([[1.0, 1.0, TURN_RATE]])
     robot = SimpleNamespace(
         data=SimpleNamespace(
