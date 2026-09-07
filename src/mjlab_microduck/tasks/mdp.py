@@ -5125,6 +5125,202 @@ def zero_command_padding(
     return torch.zeros(env.num_envs, dim, device=env.device)
 
 
+# --------------------------------------------------------------------------- #
+# Ballet: commanded one-legged hopping                                       #
+# --------------------------------------------------------------------------- #
+
+
+class BalletCommand(UniformVelocityCommand):
+    """Binary ballet command carried in the shared three-value twist slot.
+
+    The wire/runtime contract is ``[active, free_leg_side, turn]``.  V1 trains
+    one side and no turn, but keeps all three values explicit so the exported
+    policy can be installed as a generic robotd skill:
+
+    - ``active=1``: lift the configured free leg and repeat low hops;
+    - ``active=0``: land and return to the two-foot HOME stand;
+    - ``free_leg_side=+1``: left leg is free (right leg supports).
+
+    Resampling the flag mid-episode is load-bearing: robotd switches to the
+    idle command when a skill window expires, which may happen at any point in
+    the hop cycle.  Training only active episodes would make that unwind an
+    out-of-distribution transition.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._active_prob = float(getattr(cfg, "active_prob", 0.65))
+        self._free_leg_side = float(getattr(cfg, "free_leg_side", 1.0))
+        self._turn = float(getattr(cfg, "turn", 0.0))
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self.vel_command_b
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        n = len(env_ids)
+        if n == 0:
+            return
+        active = (torch.rand(n, device=self.device) < self._active_prob).float()
+        self.vel_command_b[env_ids, 0] = active
+        self.vel_command_b[env_ids, 1] = self._free_leg_side
+        self.vel_command_b[env_ids, 2] = self._turn
+
+    def _update_command(self) -> None:
+        pass
+
+    def _update_metrics(self) -> None:
+        pass
+
+
+@_dataclass(kw_only=True)
+class BalletCommandCfg(VelocityCommandCommandOnlyCfg):
+    class_type: type = BalletCommand
+    active_prob: float = 0.65
+    free_leg_side: float = 1.0
+    turn: float = 0.0
+
+    def build(self, env: ManagerBasedRlEnv) -> "BalletCommand":
+        return BalletCommand(self, env)
+
+
+def _ballet_active(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    return env.command_manager.get_command(command_name)[:, 0] > 0.5
+
+
+def _contact_found(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    """Boolean contact view shared by the ballet rewards."""
+    if sensor_name not in env.scene.sensors:
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    found = env.scene.sensors[sensor_name].data.found
+    if found.dim() > 1:
+        found = found.sum(dim=-1)
+    return found > 0
+
+
+_BALLET_FREE_FOOT_CFG = SceneEntityCfg("robot", site_names=("left_foot",))
+
+
+def ballet_unique_support(
+    env: ManagerBasedRlEnv,
+    support_sensor: str,
+    free_sensor: str,
+    command_name: str = "twist",
+) -> torch.Tensor:
+    """Reward right-support/left-free contact while ballet is active.
+
+    Flight returns zero rather than a penalty; the hop-cycle reward owns that
+    part of the motion.  The free foot touching never scores, preventing the
+    easy two-foot pogo solution.
+    """
+    active = _ballet_active(env, command_name)
+    support = _contact_found(env, support_sensor)
+    free = _contact_found(env, free_sensor)
+    return (active & support & ~free).float()
+
+
+def ballet_free_foot_height(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    std: float,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _BALLET_FREE_FOOT_CFG,
+) -> torch.Tensor:
+    """Gaussian target for the free foot's height above the local floor."""
+    asset: Entity = env.scene[asset_cfg.name]
+    z = asset.data.site_pos_w[:, asset_cfg.site_ids[0], 2]
+    z = z - env.scene.terrain.env_origins[:, 2]
+    score = torch.exp(-((torch.nan_to_num(z, nan=0.0) - target_height) / std) ** 2)
+    return score * _ballet_active(env, command_name).float()
+
+
+def ballet_commanded_pose(
+    env: ManagerBasedRlEnv,
+    when_active: bool,
+    command_name: str = "twist",
+    **pose_kwargs,
+) -> torch.Tensor:
+    """Gate the standard fixed-pose Gaussian on active or unwind mode."""
+    active = _ballet_active(env, command_name)
+    gate = active if when_active else ~active
+    return pose_target_match(env, **pose_kwargs) * gate.float()
+
+
+def ballet_commanded_height(
+    env: ManagerBasedRlEnv,
+    target_height: float,
+    std: float,
+    when_active: bool,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Gate a trunk-height target on active or unwind mode."""
+    active = _ballet_active(env, command_name)
+    gate = active if when_active else ~active
+    return height_target_gaussian(
+        env,
+        target_height=target_height,
+        asset_cfg=asset_cfg,
+        std=std,
+    ) * gate.float()
+
+
+def ballet_hop_cycle(
+    env: ManagerBasedRlEnv,
+    support_sensor: str,
+    free_sensor: str,
+    command_name: str = "twist",
+    min_air_time: float = 0.04,
+    max_air_time: float = 0.40,
+) -> torch.Tensor:
+    """One pulse for ``support -> flight -> same support``.
+
+    A small state machine makes the reward unfarmable by contact chatter.  It
+    arms only from unique support, accumulates time only with both feet clear,
+    and pays once when the support foot returns while the free foot stays off
+    the floor.  Touching the free foot invalidates the attempt.  Disabling the
+    command clears the latch so unwind cannot accidentally earn hop credit.
+    """
+    active = _ballet_active(env, command_name)
+    support = _contact_found(env, support_sensor)
+    free = _contact_found(env, free_sensor)
+    unique_support = support & ~free
+    flight = ~support & ~free
+
+    if not hasattr(env, "_ballet_ready"):
+        env._ballet_ready = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        env._ballet_airborne = torch.zeros(
+            env.num_envs, dtype=torch.bool, device=env.device
+        )
+        env._ballet_air_time = torch.zeros(env.num_envs, device=env.device)
+
+    fresh = env.episode_length_buf <= 1
+    clear = fresh | ~active | free
+    env._ballet_ready[clear] = False
+    env._ballet_airborne[clear] = False
+    env._ballet_air_time[clear] = 0.0
+
+    env._ballet_ready |= active & unique_support
+    takeoff = active & env._ballet_ready & flight
+    env._ballet_airborne |= takeoff
+    env._ballet_air_time = torch.where(
+        env._ballet_airborne & flight,
+        env._ballet_air_time + env.step_dt,
+        env._ballet_air_time,
+    )
+
+    landed = (
+        active
+        & env._ballet_airborne
+        & unique_support
+        & (env._ballet_air_time >= min_air_time)
+        & (env._ballet_air_time <= max_air_time)
+    )
+    env._ballet_airborne[landed] = False
+    env._ballet_air_time[landed] = 0.0
+    return landed.float()
+
+
 def head_pose_tracking(
     env: ManagerBasedRlEnv,
     command_name: str = "head_pose",
