@@ -5171,7 +5171,21 @@ class BalletCommand(UniformVelocityCommand):
         pass
 
     def _update_metrics(self) -> None:
-        pass
+        max_command_steps = self.cfg.resampling_time_range[1] / self._env.step_dt
+        # Reuse the standard metric names so existing dashboards keep working:
+        # XY means actual planar drift (the first two Ballet command slots are
+        # not velocities), while yaw is the commanded-rate tracking error.
+        self.metrics["error_vel_xy"] += (
+            torch.norm(self.robot.data.root_link_lin_vel_b[:, :2], dim=-1)
+            / max_command_steps
+        )
+        self.metrics["error_vel_yaw"] += (
+            torch.abs(
+                self.vel_command_b[:, 2]
+                - self.robot.data.root_link_ang_vel_b[:, 2]
+            )
+            / max_command_steps
+        )
 
 
 @_dataclass(kw_only=True)
